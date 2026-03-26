@@ -3,113 +3,55 @@ import requests
 import uuid
 import os
 from datetime import datetime
+import google.genai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from config import TELEGRAM_TOKEN, GEMINI_API_KEY
+from database import init_db, get_user, set_lang, increment_count, log_generation, log_event, update_feedback
 from prompts.ru import prompts_ru
 from prompts.en import prompts_en
-import google.generativeai as genai
 
-# Получаем переменные окружения
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Инициализация клиента Gemini
+client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = "gemini-1.5-flash"
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"  # стабильная модель
-
-# База данных будет работать с SQLite, файл создастся автоматически
-import sqlite3
-from datetime import datetime, timedelta
-
-DB_PATH = "users.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY,
-                  lang TEXT,
-                  daily_count INTEGER,
-                  last_reset TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS generations
-                 (generation_id TEXT PRIMARY KEY,
-                  user_id INTEGER,
-                  category TEXT,
-                  topic TEXT,
-                  prompt TEXT,
-                  response TEXT,
-                  tokens_used INTEGER,
-                  timestamp TEXT,
-                  feedback_rating INTEGER,
-                  feedback_comment TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS events
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  event_type TEXT,
-                  details TEXT,
-                  timestamp TEXT)''')
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT lang, daily_count, last_reset FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def set_lang(user_id, lang):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, lang, daily_count, last_reset) VALUES (?, ?, 0, ?)",
-              (user_id, lang, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-def increment_count(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET daily_count = daily_count + 1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def log_generation(generation_id, user_id, category, topic, prompt, response, tokens_used, timestamp):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''INSERT INTO generations
-                 (generation_id, user_id, category, topic, prompt, response, tokens_used, timestamp)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-              (generation_id, user_id, category, topic, prompt, response, tokens_used, timestamp))
-    conn.commit()
-    conn.close()
-
-def log_event(user_id, event_type, details):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    c.execute('''INSERT INTO events (user_id, event_type, details, timestamp)
-                 VALUES (?, ?, ?, ?)''', (user_id, event_type, details, timestamp))
-    conn.commit()
-    conn.close()
-
-def update_feedback(generation_id, rating, comment):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''UPDATE generations
-                 SET feedback_rating = ?, feedback_comment = ?
-                 WHERE generation_id = ?''', (rating, comment, generation_id))
-    conn.commit()
-    conn.close()
-
-# Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
 user_context = {}
 
+def set_commands():
+    commands_ru = [
+        {"command": "start", "description": "Начать работу с ботом"},
+        {"command": "help", "description": "Помощь и информация"},
+        {"command": "feedback", "description": "Связаться с автором"}
+    ]
+    commands_en = [
+        {"command": "start", "description": "Start working with the bot"},
+        {"command": "help", "description": "Help and info"},
+        {"command": "feedback", "description": "Contact the author"}
+    ]
+    commands_default = [
+        {"command": "start", "description": "Start / Начать"},
+        {"command": "help", "description": "Help / Помощь"},
+        {"command": "feedback", "description": "Contact / Связаться"}
+    ]
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    try:
+        requests.post(url, json={"commands": commands_ru, "language_code": "ru"})
+        requests.post(url, json={"commands": commands_en, "language_code": "en"})
+        requests.post(url, json={"commands": commands_default})
+        logging.info("Commands set successfully")
+    except Exception as e:
+        logging.error(f"Failed to set commands: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("Русский", callback_data="ru")],
-                [InlineKeyboardButton("English", callback_data="en")]]
-    await update.message.reply_text("Choose your language / Выберите язык:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [
+        [InlineKeyboardButton("Русский", callback_data="ru")],
+        [InlineKeyboardButton("English", callback_data="en")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Choose your language / Выберите язык:", reply_markup=reply_markup)
 
 async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -127,7 +69,8 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Product concept", callback_data="product"),
          InlineKeyboardButton("Random idea", callback_data="random")]
     ]
-    await query.edit_message_text(text_en if lang == "en" else text_ru, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text_en if lang == "en" else text_ru, reply_markup=reply_markup)
 
 async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -151,8 +94,10 @@ async def generate_idea(update: Update, context: ContextTypes.DEFAULT_TYPE, topi
     log_event(user_id, "generation_start", f"category={category}, topic={topic}")
 
     try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
         idea = response.text
         tokens_used = 0
     except Exception as e:
@@ -169,7 +114,9 @@ async def generate_idea(update: Update, context: ContextTypes.DEFAULT_TYPE, topi
          InlineKeyboardButton("👎 Bad", callback_data=f"fb_bad_{generation_id}")],
         [InlineKeyboardButton("💬 Comment", callback_data=f"fb_comment_{generation_id}")]
     ]
-    await update.message.reply_text(idea, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(idea, reply_markup=reply_markup)
+
     increment_count(user_id)
     del user_context[user_id]
 
@@ -236,7 +183,9 @@ async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Please send your comment in a text message.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Available commands:\n/start - choose language and start\n/help - this message\n/feedback - contact author")
+    await update.message.reply_text(
+        "Available commands:\n/start - choose language and start\n/help - this message\n/feedback - contact author"
+    )
 
 async def general_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Please send your feedback or suggestions in a text message.")
@@ -244,14 +193,20 @@ async def general_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+    set_commands()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("feedback", general_feedback))
+
     app.add_handler(CallbackQueryHandler(language_callback, pattern="^(ru|en)$"))
     app.add_handler(CallbackQueryHandler(category_callback, pattern="^(post|brand|slogan|video|product|random)$"))
     app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^fb_"))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     app.run_polling()
 
 if __name__ == "__main__":
