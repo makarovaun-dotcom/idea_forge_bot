@@ -10,7 +10,21 @@ from config import TELEGRAM_TOKEN, GEMINI_API_KEY
 from database import init_db, get_user, set_lang, increment_count, log_generation, log_event, update_feedback
 from prompts.ru import prompts_ru
 from prompts.en import prompts_en
+# В самом верху, после других импортов
+from flask import Flask
+import threading
 
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def health_check():
+    return "Idea Forge Bot is running", 200
+
+def run_web():
+    app_web.run(host='0.0.0.0', port=8080)
+
+# В функции main() перед app.run_polling() добавьте:
+threading.Thread(target=run_web, daemon=True).start()
 # Инициализация клиента Gemini
 client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-1.5-flash"
